@@ -9,9 +9,11 @@ from .cnn import CNN
 from .memory import HiddenState, Memory
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from.cnn_1D import CNN_1D
 
 __all__ = [
     "CNN",
+    "CNN_1D",
     "MLP",
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",

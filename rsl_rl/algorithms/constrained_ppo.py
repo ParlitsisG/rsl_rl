@@ -11,16 +11,16 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticCNN, ActorCriticRecurrent,ActorCriticShared
+from rsl_rl.modules import ActorCritic, ActorCriticCNN, ActorCriticRecurrent, ActorCriticShared
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
 
 
-class PPO:
+class CPPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticCNN |ActorCriticShared
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticCNN | ActorCriticShared
     """The actor critic module."""
 
     def __init__(
