@@ -17,7 +17,7 @@ from rsl_rl.networks import CNN, MLP, EmpiricalNormalization ,CNN_1D,HiddenState
 from .actor_critic import ActorCritic
 
 
-class ActorCriticShared(ActorCritic):
+class ActorCriticShared(nn.Module):
     is_recurrent: bool = True
     def __init__(
         self,
@@ -28,6 +28,7 @@ class ActorCriticShared(ActorCritic):
         stohastic_encoder :  bool = False,
         shared_network_dims : tuple[int] | list[int] = [256, 128],
         shared_hidden_dims: tuple[int] | list[int] = [128],
+        actor_hidden_dims: tuple[int] | list[int] = [128],
         critic_hidden_dims: tuple[int] | list[int] = [128],
         shared_cnn_cfg: dict[str, dict] | dict | None = None,
         code_size : int = 128,
@@ -41,11 +42,13 @@ class ActorCriticShared(ActorCritic):
         shared_endcoder: bool = True,
         **kwargs: dict[str, Any],
     ) -> None:
-        
+    
+        super().__init__()
 
         if shared_endcoder== False:
             raise ValueError(f"Method we seperate encoder not implemented yet shared_endcoder: {shared_endcoder}")
         # Get the observation dimensions
+        print(obs_groups," that is obs shape: ", {k: obs[k].shape for k in obs.keys()})
         self.obs_groups = obs_groups
         num_shared_obs_1d = 0
         self.shared_obs_groups_1d = []
@@ -69,6 +72,7 @@ class ActorCriticShared(ActorCritic):
             # Resolve the actor CNN configuration
             assert shared_cnn_cfg is not None, "An actor CNN configuration is required for 2D actor observations."
             # If a single configuration dictionary is provided, create a dictionary for each 2D observation group
+            print("shared_cnn_cfg before:", shared_cnn_cfg)
             if not all(isinstance(v, dict) for v in shared_cnn_cfg.values()):
                 shared_cnn_cfg = {group: shared_cnn_cfg for group in self.shared_obs_groups_cnn}
             # Check that the number of configs matches the number of observation groups
@@ -107,20 +111,18 @@ class ActorCriticShared(ActorCritic):
             print(
                 "ActorCriticRecurrent.__init__ got unexpected arguments, which will be ignored: " + str(kwargs.keys()),
             )
+        
 
         # Actor
         self.state_dependent_std = state_dependent_std
         self.memory_shared = Memory(num_shared_obs_1d + encoding_dim, rnn_hidden_dim, rnn_num_layers, rnn_type)
+        print(f"rnn_hidden_dim:{rnn_hidden_dim}, code_size:{code_size}, shared_hidden_dims:{shared_hidden_dims}")
         if stohastic_encoder:
-            self.shared_MLP = MLP(rnn_hidden_dim, code_size, shared_hidden_dims, activation)
+            shared_output = code_size*2  #2*code size because we get mean and variance output for the features.
         else:
-            self.shared_MLP = MLP(rnn_hidden_dim, code_size*2, shared_hidden_dims, activation) # 2*code size because we get mean and variance output for the features.
+            shared_output = code_size
+        self.shared_MLP = MLP(rnn_hidden_dim, shared_output, shared_hidden_dims, activation) 
         
-        if self.state_dependent_std:
-            self.shared_MLP = MLP(rnn_hidden_dim, [2, num_actions], shared_hidden_dims, activation)
-        else:
-            self.shared_MLP = MLP(rnn_hidden_dim, num_actions, shared_hidden_dims, activation)
-
         print(f"Shared RNN: {self.memory_shared}")
         print(f"Shared MLP: {self.shared_MLP}")
 
@@ -129,9 +131,16 @@ class ActorCriticShared(ActorCritic):
         if shared_obs_normalization:
             self.shared_obs_normalizer = EmpiricalNormalization(num_shared_obs_1d)
         else:
-            self.shared_obs_normalizer = torch.nn.Identity()      
+            self.shared_obs_normalizer = torch.nn.Identity()     
 
-        self.critic = MLP(shared_network_dims[len(shared_network_dims) - 1]*2, 1, critic_hidden_dims, activation)
+        if self.state_dependent_std:
+            self.actor = MLP(shared_output, [2, num_actions],actor_hidden_dims, activation)
+        else:
+            self.actor = MLP(shared_output, num_actions, actor_hidden_dims, activation)
+
+   
+
+        self.critic = MLP(shared_output, 1, critic_hidden_dims, activation)
         print(f"Critic MLP: {self.critic}")
 
 
@@ -179,6 +188,7 @@ class ActorCriticShared(ActorCritic):
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         self.memory_shared.reset(dones)
+        
        
     def forward(self) -> NoReturn:
         raise NotImplementedError
@@ -207,38 +217,62 @@ class ActorCriticShared(ActorCritic):
         # Create distribution
         self.distribution = Normal(mean, std)
 
-    def act(self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None) -> torch.Tensor:
-        mlp_obs, cnn_obs = self.get_shared_obs(obs)
-        out_cnn= self.shared_cnn(cnn_obs)
-        mlp_obs = self.shared_obs_normalizer(mlp_obs)
-        input_mem = torch.cat((out_cnn,mlp_obs),dim=-1)
-        out_mem = self.memory_shared(input_mem, masks, hidden_state).squeeze(0)
-        out_mlp = self.shared_MLP(out_mem)
-        self._update_distribution(out_mlp)
+    def act(self, obs: torch.Tensor) -> torch.Tensor:
+        self._update_distribution(obs)
         return self.distribution.sample()
+    
+    def extract_features(self,obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None)->torch.Tensor:
+        mlp_obs, cnn_obs = self.get_shared_obs(obs)
+        if self.shared_cnns is not None:
+            # Encode the 2D actor observations
+            cnn_enc_list = []
+            for obs_group in self.shared_obs_groups_cnn:
+                x = cnn_obs[obs_group]
+
+                # If sequence dimension exists → merge seq and batch
+                if x.dim() == 4:        # (seq, batch, C, L)
+                    seq, b, C, L = x.shape
+                    x = x.reshape(seq * b, C, L)
+                    enc = self.shared_cnns[obs_group](x)
+                    enc = enc.reshape(seq, b, -1)
+
+                elif x.dim()==3:                   # (batch, C, L)
+                    enc = self.shared_cnns[obs_group](x)
+                    enc = enc.unsqueeze(0)   # → (1, batch, feat)
+                else:
+                    raise ValueError("not implemented yet")
+                cnn_enc_list.append(enc)
+            cnn_enc = torch.cat(cnn_enc_list, dim=-1)
+            if mlp_obs.dim() != cnn_enc.dim():
+                cnn_enc=cnn_enc.squeeze()
+            #cnn_enc_list = [self.shared_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.shared_obs_groups_cnn]
+            #cnn_enc = torch.cat(cnn_enc_list, dim=-1)
+            # Concatenate to the MLP observations
+        mlp_obs = self.shared_obs_normalizer(mlp_obs)
+        combined_obs = torch.cat([mlp_obs, cnn_enc], dim=-1)
+        out_mem = self.memory_shared(combined_obs, masks, hidden_state).squeeze(0)
+        code = self.shared_MLP(out_mem)
+        return code
+    
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
         mlp_obs, cnn_obs = self.get_shared_obs(obs)
-        out_cnn= self.shared_cnn(cnn_obs)
-        mlp_obs = self.shared_obs_normalizer(mlp_obs) 
-        input_mem = torch.cat((out_cnn,mlp_obs),dim=-1)
-        out_mem = self.memory_shared(input_mem).squeeze(0)
+        if self.shared_cnns is not None:
+            # Encode the 2D actor observations
+            cnn_enc_list = [self.shared_cnns[obs_group](cnn_obs[obs_group]) for obs_group in self.shared_obs_groups_cnn]
+            cnn_enc = torch.cat(cnn_enc_list, dim=-1)
+        mlp_obs = self.shared_obs_normalizer(mlp_obs)
+        combined_obs = torch.cat([mlp_obs, cnn_enc], dim=-1)
+        assert combined_obs is not None
+        out_mem = self.memory_shared(combined_obs).squeeze(0)
         out_mlp = self.shared_MLP(out_mem)
         if self.state_dependent_std:
             return self.actor(out_mlp)[..., 0, :]
         else:
             return self.actor(out_mlp)
 
-    def evaluate(
-        self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
-    ) -> torch.Tensor:
-        mlp_obs, cnn_obs = self.get_shared_obs(obs)
-        out_cnn= self.shared_cnn(cnn_obs)
-        mlp_obs = self.shared_obs_normalizer(mlp_obs)
-        input_mem = torch.cat((out_cnn,mlp_obs),dim=-1)
-        out_mem = self.memory_shared(obs, masks, hidden_state).squeeze(0)
-        out_mlp = self.shared_MLP(out_mem)
-        return self.critic(out_mlp)
+    def evaluate(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.critic(obs)
 
     def get_shared_obs(self, obs: TensorDict) -> torch.Tensor:
         obs_list_1d = [obs[obs_group] for obs_group in self.shared_obs_groups_1d]
@@ -250,8 +284,8 @@ class ActorCriticShared(ActorCritic):
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
         return self.distribution.log_prob(actions).sum(dim=-1)
 
-    def get_hidden_states(self) -> HiddenState:
-        return self.memory_shared.hidden_state
+    def get_hidden_states(self) -> tuple[HiddenState, HiddenState]:
+        return self.memory_shared.hidden_state,self.memory_shared.hidden_state
 
     def update_normalization(self, obs: TensorDict) -> None:
         if self.shared_obs_normalization:

@@ -47,10 +47,12 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        shared_encoder: bool =True
     ) -> None:
         # Device-related parameters
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
+        self.shared_encoder = shared_encoder
 
         # Multi-GPU parameters
         if multi_gpu_cfg is not None:
@@ -127,8 +129,12 @@ class PPO:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # Compute the actions and values
-        self.transition.actions = self.policy.act(obs).detach()
-        self.transition.values = self.policy.evaluate(obs).detach()
+        if self.shared_encoder:
+            latent_features = self.policy.extract_features(obs).detach()
+        else:
+            raise ValueError("not implemented yet")
+        self.transition.actions = self.policy.act(latent_features ).detach()
+        self.transition.values = self.policy.evaluate(latent_features).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
@@ -170,7 +176,7 @@ class PPO:
     def compute_returns(self, obs: TensorDict) -> None:
         st = self.storage
         # Compute value for the last step
-        last_values = self.policy.evaluate(obs).detach()
+        last_values = self.policy.evaluate(self.policy.extract_features(obs)).detach()
         # Compute returns and advantages
         advantage = 0
         for step in reversed(range(st.num_transitions_per_env)):
@@ -246,9 +252,13 @@ class PPO:
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
-            self.policy.act(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[0])
+            if self.shared_encoder:
+                latent_features = self.policy.extract_features(obs_batch,masks=masks_batch,hidden_state=hidden_states_batch[0]).detach()
+            else:
+                raise ValueError("not implemented yet")
+            self.policy.act(latent_features)
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-            value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
+            value_batch = self.policy.evaluate(latent_features)
             # Note: We only keep the entropy of the first augmentation (the original one)
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
