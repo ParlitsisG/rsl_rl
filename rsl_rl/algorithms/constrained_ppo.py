@@ -11,16 +11,16 @@ import torch.optim as optim
 from itertools import chain
 from tensordict import TensorDict
 
-from rsl_rl.modules import ActorCritic, ActorCriticCNN, ActorCriticRecurrent, ActorCriticShared
+from rsl_rl.modules import ActorCritic, ActorCriticCNN, ActorCriticRecurrent,ActorCriticShared
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
+from rsl_rl.algorithms.ppo import PPO
 
-
-class CPPO:
+class L_PPO(PPO):
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic | ActorCriticRecurrent | ActorCriticCNN | ActorCriticShared
+    policy: ActorCritic | ActorCriticRecurrent | ActorCriticCNN |ActorCriticShared
     """The actor critic module."""
 
     def __init__(
@@ -40,6 +40,8 @@ class CPPO:
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
         normalize_advantage_per_mini_batch: bool = False,
+        normalize_cost_advantage_per_mini_batch: bool = False,
+        budget_cost: int = 2.0,
         device: str = "cpu",
         # RND parameters
         rnd_cfg: dict | None = None,
@@ -47,10 +49,15 @@ class CPPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        shared_encoder: bool =True,
+        lambda_init: float = 0.01,
+        lambda_lr: float = 0.01,
     ) -> None:
-        # Device-related parameters
+        #super(PPO, self).__init__()
+         # Device-related parameters
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
+        self.shared_encoder = shared_encoder
 
         # Multi-GPU parameters
         if multi_gpu_cfg is not None:
@@ -97,12 +104,26 @@ class CPPO:
         else:
             self.symmetry = None
 
+        self.constrained_rl = True
+        self.budget_d =budget_cost
+        # Device-related parameters
+        self.device = device
+        self.is_multi_gpu = multi_gpu_cfg is not None
+        self.shared_encoder = shared_encoder
+
         # PPO components
         self.policy = policy
         self.policy.to(self.device)
-
-        # Create the optimizer
+        lambda_init = torch.tensor(lambda_init, dtype=torch.float32)
+        self.lagrange_lambda = torch.log(torch.clamp(torch.exp(lambda_init) - 1, min=1e-8)).to(self.device)
+        
+        self.lambda_lr = lambda_lr
+        # Create the optimizers
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        
+
+
+
 
         # Add storage
         self.storage = storage
@@ -123,15 +144,25 @@ class CPPO:
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
+        self.cost_value_loss_coef = value_loss_coef # the same since the lagrangian handles the relationship between the reward and cost.
+        self.normalize_cost_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+
     def act(self, obs: TensorDict) -> torch.Tensor:
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # Compute the actions and values
-        self.transition.actions = self.policy.act(obs).detach()
-        self.transition.values = self.policy.evaluate(obs).detach()
+        if self.shared_encoder:
+            latent_features = self.policy.extract_features(obs).detach()
+            self.transition.actions = self.policy.act(latent_features ).detach()
+            self.transition.values = self.policy.evaluate(latent_features).detach()
+            self.transition.cost_values = self.policy.safety_evaluate(latent_features).detach()
+        else:
+            raise ValueError("not implemented yet")
+        
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
+      
         # Record observations before env.step()
         self.transition.observations = obs
         return self.transition.actions
@@ -144,9 +175,17 @@ class CPPO:
         if self.rnd:
             self.rnd.update_normalization(obs)
 
+        if "costs" not in extras:
+            raise ValueError(
+                "Constrained RL is enabled, but 'extras' does not contain 'costs'. "
+                "Use extras['costs'] to provide the constraint signal."
+            )
+
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
         self.transition.rewards = rewards.clone()
+        self.transition.costs = extras["costs"].clone()
+        self.transition.total_costs = extras["total_costs"].clone()
         self.transition.dones = dones
 
         # Compute the intrinsic rewards and add to extrinsic rewards
@@ -161,6 +200,10 @@ class CPPO:
             self.transition.rewards += self.gamma * torch.squeeze(
                 self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
             )
+            
+            self.transition.costs += self.gamma * torch.squeeze(
+                self.transition.cost_values * extras["time_outs"].unsqueeze(1).to(self.device), 1
+            )
 
         # Record the transition
         self.storage.add_transition(self.transition)
@@ -170,9 +213,15 @@ class CPPO:
     def compute_returns(self, obs: TensorDict) -> None:
         st = self.storage
         # Compute value for the last step
-        last_values = self.policy.evaluate(obs).detach()
+        if self.shared_encoder:
+            latent_features = self.policy.extract_features(obs).detach()
+        else:
+            raise ValueError("not implemented yet")
+        last_values = self.policy.evaluate(latent_features).detach()
+        last_cost_values = self.policy.safety_evaluate(latent_features).detach()
         # Compute returns and advantages
         advantage = 0
+        cost_advantage = 0
         for step in reversed(range(st.num_transitions_per_env)):
             # If we are at the last step, bootstrap the return value
             next_values = last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
@@ -184,20 +233,42 @@ class CPPO:
             advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
             # Return: R_t = A(s_t, a_t) + V(s_t)
             st.returns[step] = advantage + st.values[step]
+
+            #REPEAT FOR COST TERMS
+
+            # If we are at the last step, bootstrap the return value
+            next_cost_values = last_cost_values if step == st.num_transitions_per_env - 1 else st.cost_values[step + 1]
+    
+            # TD error: c_t + gamma * V(s_{t+1}) - V(s_t)
+            cost_delta = st.costs[step] + next_is_not_terminal * self.gamma * next_cost_values - st.cost_values[step]
+
+            # Advantage: A(s_t, a_t) = c_delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
+            cost_advantage = cost_delta + next_is_not_terminal * self.gamma * self.lam * cost_advantage
+            # Return: R_t = A(s_t, a_t) + V(s_t)
+            st.cost_returns[step] = cost_advantage + st.cost_values[step]
+
+
         # Compute the advantages
         st.advantages = st.returns - st.values
+        st.cost_advantages = st.cost_returns - st.cost_values
         # Normalize the advantages if per minibatch normalization is not used
         if not self.normalize_advantage_per_mini_batch:
             st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+            st.cost_advantages = (st.cost_advantages - st.cost_advantages.mean()) / (st.cost_advantages.std() + 1e-8)
 
     def update(self) -> dict[str, float]:
         mean_value_loss = 0
+        mean_cost_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+
+        mean_lambda_loss=0
+        mean_lambda_loss_count=0
+
 
         # Get mini batch generator
         if self.policy.is_recurrent:
@@ -217,6 +288,10 @@ class CPPO:
             old_sigma_batch,
             hidden_states_batch,
             masks_batch,
+            target_cost_values_batch,
+            cost_advantages_batch,
+            cost_returns_batch,
+            total_costs
         ) in generator:
             num_aug = 1  # Number of augmentations per sample. Starts at 1 for no augmentation.
             original_batch_size = obs_batch.batch_size[0]
@@ -225,6 +300,7 @@ class CPPO:
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+                    cost_advantages_batch= (cost_advantages_batch - cost_advantages_batch.mean()) / (cost_advantages_batch.std() + 1e-8)
 
             # Perform symmetric augmentation
             if self.symmetry and self.symmetry["use_data_augmentation"]:
@@ -246,9 +322,14 @@ class CPPO:
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with the new parameters
-            self.policy.act(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[0])
+            if self.shared_encoder:
+                latent_features = self.policy.extract_features(obs_batch,masks=masks_batch,hidden_state=hidden_states_batch[0]).detach()
+            else:
+                raise ValueError("not implemented yet")
+            self.policy.act(latent_features)
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-            value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
+            value_batch = self.policy.evaluate(latent_features)
+            cost_value_batch= self.policy.safety_evaluate(latent_features)
             # Note: We only keep the entropy of the first augmentation (the original one)
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
@@ -290,10 +371,12 @@ class CPPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
+        
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
+            lagrange_advantages_batch = advantages_batch - self.lagrange_lambda.detach() * cost_advantages_batch
+            surrogate = -torch.squeeze(lagrange_advantages_batch) * ratio
+            surrogate_clipped = -torch.squeeze(lagrange_advantages_batch) * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
@@ -309,7 +392,34 @@ class CPPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+
+            # Cost Value function loss
+            if self.use_clipped_value_loss:
+                cost_value_clipped = target_cost_values_batch + (cost_value_batch - target_cost_values_batch).clamp(
+                    -self.clip_param, self.clip_param
+                )
+                cost_value_losses = (cost_value_batch - cost_returns_batch).pow(2)
+                cost_value_losses_clipped = (cost_value_clipped - cost_returns_batch).pow(2)
+                cost_value_loss = torch.max(cost_value_losses, cost_value_losses_clipped).mean()
+            else:
+                cost_value_loss = (cost_value_batch - cost_returns_batch).pow(2).mean()
+
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() 
+            + self.value_loss_coef * cost_value_loss
+
+            #langragian lambda paramter loss
+            total_cost_mask= total_costs >= 0 #only consider costs that are valid (non-negative)
+            total_costs= total_costs[total_cost_mask]
+            if total_costs.numel() > 0:
+                langragian_lambda_loss = (total_costs.mean() - self.budget_d)
+                self.lagrange_lambda  =torch.clamp(self.lagrange_lambda + self.lambda_lr * langragian_lambda_loss,min=0.0)
+                print("lagrange lambda loss:", langragian_lambda_loss)
+                print("Lagrange lambda:", self.lagrange_lambda.item())
+                print("total_costs_mean:", total_costs.mean().item())
+                
+            else:
+                langragian_lambda_loss = None
+        
 
             # Symmetry loss
             if self.symmetry:
@@ -362,6 +472,7 @@ class CPPO:
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
             loss.backward()
+            
             # Compute the gradients for RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()
@@ -380,8 +491,14 @@ class CPPO:
 
             # Store the losses
             mean_value_loss += value_loss.item()
+            mean_cost_value_loss += cost_value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
+
+            if langragian_lambda_loss is not None:
+                mean_lambda_loss += langragian_lambda_loss.item()
+                mean_lambda_loss_count +=1
+
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -394,6 +511,9 @@ class CPPO:
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_cost_value_loss /= num_updates
+        if mean_lambda_loss_count >0:
+            mean_lambda_loss /= mean_lambda_loss_count
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
@@ -405,14 +525,16 @@ class CPPO:
         # Construct the loss dictionary
         loss_dict = {
             "value": mean_value_loss,
+            "cost_value": mean_cost_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
+        if mean_lambda_loss_count >0:
+            loss_dict["lagrange_lambda"] = mean_lambda_loss
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
-
         return loss_dict
 
     def broadcast_parameters(self) -> None:

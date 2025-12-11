@@ -6,7 +6,7 @@
 """Implementation of different learning algorithms."""
 
 from .distillation import Distillation
-from .constrained_ppo import CPPO
+from .constrained_ppo import L_PPO
 from .ppo import PPO
 
-__all__ = ["PPO", "Distillation"]
+__all__ = ["PPO","L_PPO" "Distillation"]

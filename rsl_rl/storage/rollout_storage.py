@@ -33,7 +33,10 @@ class RolloutStorage:
             self.actions_log_prob: torch.Tensor
             self.action_mean: torch.Tensor | None = None
             self.action_sigma: torch.Tensor | None = None
-            self.hidden_states: tuple[HiddenState, HiddenState] = (None, None)
+            self.hidden_states: tuple[HiddenState, HiddenState] = (None, None),
+            self.cost_values: torch.Tensor | None = None
+            self.costs: torch.Tensor | None = None
+            self.total_costs: torch.Tensor | None = None
 
         def clear(self) -> None:
             self.__init__()
@@ -46,12 +49,16 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int] | list[int],
         device: str = "cpu",
+        constrained_rl: bool = False
     ) -> None:
         self.training_type = training_type
         self.device = device
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
         self.actions_shape = actions_shape
+        self.constrained_rl =  constrained_rl
+
+        print(f"Cosntrained RL: {self.constrained_rl}")
 
         # Core
         self.observations = TensorDict(
@@ -75,7 +82,12 @@ class RolloutStorage:
             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
-
+            if self.constrained_rl == True:
+                self.costs = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+                self.cost_values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+                self.cost_advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+                self.cost_returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+                self.total_costs = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         # For RNN networks
         self.saved_hidden_state_a = None
         self.saved_hidden_state_c = None
@@ -104,6 +116,12 @@ class RolloutStorage:
             self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
             self.mu[self.step].copy_(transition.action_mean)
             self.sigma[self.step].copy_(transition.action_sigma)
+            if self.constrained_rl:
+                self.cost_values[self.step].copy_(transition.cost_values)
+                self.costs[self.step].copy_(transition.costs.view(-1, 1))
+                self.total_costs[self.step].copy_(transition.total_costs)
+
+
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -135,10 +153,16 @@ class RolloutStorage:
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
+        if self.constrained_rl == True:
+            cost_returns = self.cost_returns.flatten(0, 1)
+            cost_values = self.cost_values.flatten(0, 1)
 
         # For PPO
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
         advantages = self.advantages.flatten(0, 1)
+        if self.constrained_rl == True:
+            cost_advantages= self.cost_advantages.flatten(0, 1)
+        total_costs = self.total_costs.flatten(0,1)
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
 
@@ -158,27 +182,54 @@ class RolloutStorage:
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
-
+                
                 hidden_state_a_batch = None
                 hidden_state_c_batch = None
                 masks_batch = None
 
-                # Yield the mini-batch
-                yield (
-                    obs_batch,
-                    actions_batch,
-                    target_values_batch,
-                    advantages_batch,
-                    returns_batch,
-                    old_actions_log_prob_batch,
-                    old_mu_batch,
-                    old_sigma_batch,
-                    (
-                        hidden_state_a_batch,
-                        hidden_state_c_batch,
-                    ),
-                    masks_batch,
-                )
+                if self.constrained_rl:
+                    cost_advantages_batch = cost_advantages[batch_idx]
+                    cost_returns_batch = cost_returns[batch_idx]
+                    target_cost_values_batch = cost_values[batch_idx]
+                    total_costs_batch = total_costs[batch_idx]
+                    # Yield the mini-batch
+                    yield (
+                        obs_batch,
+                        actions_batch,
+                        target_values_batch,
+                        advantages_batch,
+                        returns_batch,
+                        old_actions_log_prob_batch,
+                        old_mu_batch,
+                        old_sigma_batch,
+                        (
+                            hidden_state_a_batch,
+                            hidden_state_c_batch,
+                        ),
+                        masks_batch,
+                        target_cost_values_batch,
+                        cost_advantages_batch,
+                        cost_returns_batch,
+                        total_costs_batch
+
+                    )
+                else:
+                    # Yield the mini-batch
+                    yield (
+                        obs_batch,
+                        actions_batch,
+                        target_values_batch,
+                        advantages_batch,
+                        returns_batch,
+                        old_actions_log_prob_batch,
+                        old_mu_batch,
+                        old_sigma_batch,
+                        (
+                            hidden_state_a_batch,
+                            hidden_state_c_batch,
+                        ),
+                        masks_batch,
+                    )
 
     # For reinforcement learning with recurrent networks
     def recurrent_mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
@@ -209,6 +260,11 @@ class RolloutStorage:
                 advantages_batch = self.advantages[:, start:stop]
                 values_batch = self.values[:, start:stop]
                 old_actions_log_prob_batch = self.actions_log_prob[:, start:stop]
+                if self.constrained_rl == True:
+                    target_cost_values_batch = self.cost_values[:,start:stop]
+                    cost_advantages_batch = self.cost_advantages[:, start:stop]
+                    cost_returns_batch = self.cost_returns[:, start:stop]
+                    total_costs_batch =self.total_costs[:, start:stop]
 
                 # Reshape to [num_envs, time, num layers, hidden dim]
                 # Original shape: [time, num_layers, num_envs, hidden_dim])
@@ -236,21 +292,43 @@ class RolloutStorage:
                 )
 
                 # Yield the mini-batch
-                yield (
-                    obs_batch,
-                    actions_batch,
-                    values_batch,
-                    advantages_batch,
-                    returns_batch,
-                    old_actions_log_prob_batch,
-                    old_mu_batch,
-                    old_sigma_batch,
-                    (
-                        hidden_state_a_batch,
-                        hidden_state_c_batch,
-                    ),
-                    masks_batch,
-                )
+                if self.constrained_rl:
+                    yield (
+                        obs_batch,
+                        actions_batch,
+                        values_batch,
+                        advantages_batch,
+                        returns_batch,
+                        old_actions_log_prob_batch,
+                        old_mu_batch,
+                        old_sigma_batch,
+                        (
+                            hidden_state_a_batch,
+                            hidden_state_c_batch,
+                        ),
+                        masks_batch,
+                        target_cost_values_batch,
+                        cost_advantages_batch,
+                        cost_returns_batch,
+                        total_costs_batch
+                    )
+
+                else:
+                    yield (
+                        obs_batch,
+                        actions_batch,
+                        values_batch,
+                        advantages_batch,
+                        returns_batch,
+                        old_actions_log_prob_batch,
+                        old_mu_batch,
+                        old_sigma_batch,
+                        (
+                            hidden_state_a_batch,
+                            hidden_state_c_batch,
+                        ),
+                        masks_batch,
+                    )
 
                 first_traj = last_traj
 

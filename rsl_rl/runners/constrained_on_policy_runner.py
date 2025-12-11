@@ -11,7 +11,7 @@ import torch
 import warnings
 from tensordict import TensorDict
 
-from rsl_rl.algorithms import PPO
+from rsl_rl.algorithms import L_PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
@@ -26,7 +26,7 @@ from rsl_rl.utils import resolve_obs_groups
 from rsl_rl.utils.logger import Logger
 
 
-class OnPolicyRunner:
+class ConstrainedOnPolicyRunner:
     """On-policy runner for training and evaluation of actor-critic methods."""
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
@@ -247,7 +247,7 @@ class OnPolicyRunner:
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
 
-    def _construct_algorithm(self, obs: TensorDict) -> PPO:
+    def _construct_algorithm(self, obs: TensorDict) -> L_PPO:
         """Construct the actor-critic algorithm."""
         # Resolve RND config if used
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
@@ -275,12 +275,12 @@ class OnPolicyRunner:
 
         # Initialize the storage
         storage = RolloutStorage(
-            "rl", self.env.num_envs, self.cfg["num_steps_per_env"], obs, [self.env.num_actions], self.device
+            "rl", self.env.num_envs, self.cfg["num_steps_per_env"], obs, [self.env.num_actions], self.device ,constrained_rl=True,
         )
 
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        alg: PPO = alg_class(
+        alg: L_PPO = alg_class(
             actor_critic, storage, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 

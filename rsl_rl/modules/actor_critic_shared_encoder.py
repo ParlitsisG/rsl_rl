@@ -40,6 +40,7 @@ class ActorCriticShared(nn.Module):
         rnn_hidden_dim: int = 512,
         rnn_num_layers: int = 1,
         shared_endcoder: bool = True,
+        safety_critic: bool = False,
         **kwargs: dict[str, Any],
     ) -> None:
     
@@ -143,6 +144,10 @@ class ActorCriticShared(nn.Module):
         self.critic = MLP(shared_output, 1, critic_hidden_dims, activation)
         print(f"Critic MLP: {self.critic}")
 
+        if safety_critic:
+            self.safety_critic = MLP(shared_output, 1, critic_hidden_dims, activation)
+            print(f"Safety Critic MLP: {self.safety_critic}")
+
 
 
         # Action noise
@@ -232,6 +237,8 @@ class ActorCriticShared(nn.Module):
                 # If sequence dimension exists → merge seq and batch
                 if x.dim() == 4:        # (seq, batch, C, L)
                     seq, b, C, L = x.shape
+                    if b==0:
+                        raise ValueError("Batch size is zero")
                     x = x.reshape(seq * b, C, L)
                     enc = self.shared_cnns[obs_group](x)
                     enc = enc.reshape(seq, b, -1)
@@ -273,6 +280,9 @@ class ActorCriticShared(nn.Module):
 
     def evaluate(self, obs: torch.Tensor) -> torch.Tensor:
         return self.critic(obs)
+    
+    def safety_evaluate(self, obs: torch.Tensor) -> torch.Tensor: #used for constrained RL where a safety critic is needed.
+        return self.safety_critic(obs)
 
     def get_shared_obs(self, obs: TensorDict) -> torch.Tensor:
         obs_list_1d = [obs[obs_group] for obs_group in self.shared_obs_groups_1d]
